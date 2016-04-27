@@ -1,0 +1,409 @@
+/* ----------------------------------------------------------------------- *//**
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ *
+ * @file knn.sql_in
+ *
+ * @brief SQL functions for k-nearest neighbor algorithm
+ * @date September 2015
+ *
+ *
+ *//* ----------------------------------------------------------------------- */
+
+m4_include(`SQLCommon.m4')
+
+
+/*
+ * @brief knn return type
+ *
+ * A composite value:
+ *  - <tt>indexes</tt> -  matrix[n][k] of k-nearest neighbors' indexes, 
+ * which specifies data point indexed i, 
+ * whose k-nearest neighbors are in columns 0 to k-1.
+ * each column is the index of 
+ *  - <tt>distances</tt> - array of k-nearest neighbors' distances
+ */
+DROP TYPE IF EXISTS MADLIB_SCHEMA.knn_result CASCADE;
+CREATE TYPE MADLIB_SCHEMA.knn_result AS (
+    indexes INTEGER[][],
+    distances DOUBLE PRECISION[][]
+);
+
+
+/*
+ * @brief knn state type (\\TODO This is usually inter-iteration state, do I need this for knn??)
+ *
+ * A composite value like \ref{knn_result}.
+ *  - <tt>indexes</tt>
+ *    <tt>distances</tt>
+ */
+/** 
+DROP TYPE IF EXISTS MADLIB_SCHEMA.knn_state CASCADE;
+CREATE TYPE MADLIB_SCHEMA.knn_state AS (
+    indexes INTEGER[][],
+    distances DOUBLE PRECISION[][]
+);
+*/
+
+/**
+ * @internal
+ * @brief Execute a SQL command where $1, ..., $4 are substituted with the
+  *     given arguments.
+ */
+CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.internal_execute_using_knn_args(
+    sql VARCHAR, DOUBLE PRECISION[][], REGPROC, INTEGER, DOUBLE PRECISION, VARCHAR
+) RETURNS VOID
+VOLATILE
+CALLED ON NULL INPUT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'exec_sql_using'
+m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `NO SQL', `');
+
+
+/** Actual implementation done in python function compute_knn in file knn in module knn */
+CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.internal_compute_knn(
+    rel_args VARCHAR,
+    rel_state VARCHAR,
+    rel_source VARCHAR,
+    expr_point VARCHAR, //TODO: Modify the arguments
+    agg_centroid VARCHAR)
+RETURNS INTEGER
+VOLATILE
+LANGUAGE plpythonu
+AS $$PythonFunction(knn, knn, compute_knn)$$
+m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `MODIFIES SQL DATA', `');
+
+
+/** Validate the knn src */
+CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.__knn_validate_src(
+    rel_source      VARCHAR
+) RETURNS VOID AS $$
+    PythonFunction(knn, knn, knn_validate_src)
+$$ LANGUAGE plpythonu
+m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `READS SQL DATA', `');
+
+
+/** Validate the knn args */
+CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.__knn_validate_args(
+    rel_train VARCHAR,
+    rel_test VARCHAR,
+    ignore_col_train VARCHAR,
+    k INTEGER,
+) RETURNS VOID AS $$
+DECLARE
+  num_points INTEGER;
+  rel_train_regclass REGCLASS;
+  rel_test_regclass REGCLASS;
+  cols_train INTEGER;
+  cols_test  INTEGER;
+  rel_filtered VARCHAR;
+BEGIN
+    rel_train_regclass := rel_train;
+    rel_test_regclass := rel_test;
+
+    IF (k <= 0) THEN
+        RAISE EXCEPTION 'k must be a positive integer.';
+    END IF;
+    IF (k > 32767) THEN
+        RAISE EXCEPTION 'knn Error: Number of nearest neighbors exceeded maximum limit
+        Number of k must be <= 32767 (for results to be returned in a
+        reasonable amount of time).';
+    END IF;
+
+    EXECUTE $sql$ SELECT count(*)
+                  FROM $sql$ || textin(regclassout(rel_train_regclass)) || $sql$
+            INTO num_points ;
+    IF (num_points < k) THEN
+        RAISE EXCEPTION 'k is greater than number of points in the training set.';
+    END IF;
+
+
+    EXECUTE $sql$
+        `SELECT count(column_name) FROM information_schema.columns WHERE table_name=` || rel_train_regclass
+	INTO cols_train;
+    EXECUTE $sql$
+	`SELECT count(column_name) FROM information_schema.columns WHERE table_name=` || rel_test_regclass
+	INTO cols_test;
+	//TODO: train can have one extra column
+    IF ( cols_train != cols_test) THEN
+        RAISE EXCEPTION 'Knn error: Feature columns are  of different dimensions.';
+    END IF;
+
+END;
+$$ LANGUAGE plpgsql VOLATILE
+m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `READS SQL DATA', `');
+
+/** Passes Default k=1 to other __validate_args */
+CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.__knn_validate_args(
+    rel_train VARCHAR,
+    rel_test VARCHAR,
+    ignore_col_train VARCHAR,
+    k INTEGER
+) RETURNS VOID AS $$
+DECLARE
+BEGIN
+    PERFORM MADLIB_SCHEMA.__knn_validate_args($1, $2, $3, 1.0::DOUBLE PRECISION);
+END;
+$$ LANGUAGE plpgsql VOLATILE
+m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `READS SQL DATA', `');
+
+/**
+ * @brief Perform k-nearest neighbor search
+ *
+ * @param rel_source Name of the relation containing input points
+ * @param ignore_col Name of columns to be ignored (e.g the class column)
+ * @param fn_dist Name of a function with signature
+ *     <tt>DOUBLE PRECISION[] x DOUBLE PRECISION[] -> DOUBLE PRECISION</tt> that
+ *     returns the distance between two points. The default is the
+ *     \ref squared_dist_norm2(float8[],float8[]) "squared Euclidean distance".
+ * @param fn_dist_weighting Name of a function with signature
+ *     <tt>DOUBLE PRECISION -> DOUBLE PRECISION</tt> that, for each
+ *     distance, returns a weighted distance value. The default is the \\TODO
+ * @param k	number of nearest neighbors
+ * @returns A composite value:
+ *  	- <tt>indexes</tt> -  matrix[n][k] of k-nearest neighbors' indexes, 
+ * 	which specifies data point indexed i, 
+ * 	whose k-nearest neighbors are in columns 0 to k-1.
+ * 	each column is the index of 
+ *  	- <tt>distances</tt> - array of k-nearest neighbors' distances
+ */
+CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.knn(
+    rel_train VARCHAR,
+    rel_test VARCHAR,
+    ignore_col_train VARCHAR,
+    fn_dist VARCHAR /*+ DEFAULT 'squared_dist_norm2' */,
+    fn_dist_weighting VARCHAR /*+ DEFAULT 'none' */,
+    k INTEGER /*+ DEFAULT 1 */,
+) RETURNS MADLIB_SCHEMA.knn_result AS $$
+DECLARE
+    theResult MADLIB_SCHEMA.knn_result;
+    oldClientMinMessages VARCHAR;
+    rel_train_regclass REGCLASS;
+    rel_test_regclass REGCLASS;
+    proc_fn_dist REGPROCEDURE;
+    proc_fn_dist_weighting REGPROCEDURE;
+    neighbors INTEGER[];
+    distances DOUBLE PRECISION[];
+    distance DOUBLE PRECISION;
+    rel_test_size INTEGER;
+    num_points INTEGER;
+    old_optimizer TEXT;
+BEGIN
+    oldClientMinMessages :=
+        (SELECT setting FROM pg_settings WHERE name = 'client_min_messages');
+    EXECUTE 'SET client_min_messages TO warning';
+
+	/** no idea what this is doing */
+    m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `
+        EXECUTE $sql$ SHOW optimizer $sql$ into old_optimizer;
+        EXECUTE $sql$ SET optimizer=off $sql$;', `') -- disable ORCA before MPP-23166 is fixed
+
+	/** validate the training set table */
+    PERFORM MADLIB_SCHEMA.__knn_validate_src(rel_train);
+
+	/** validate the knn arguments */
+    PERFORM MADLIB_SCHEMA.__knn_validate_args(rel_train, rel_test, ignore_col_train, k);
+
+    rel_train_regclass := rel_train;
+    rel_test_regclass := rel_test;
+
+    proc_fn_dist := fn_dist
+        || '(DOUBLE PRECISION[], DOUBLE PRECISION[])';
+    IF (SELECT prorettype != 'DOUBLE PRECISION'::regtype OR proisagg = TRUE
+        FROM pg_proc WHERE oid = proc_fn_dist) THEN
+        RAISE EXCEPTION 'knn error: Distance function has wrong signature or is not a simple function.';
+    END IF;
+
+    proc_fn_dist_weighting := fn_dist_weighting
+        || '(DOUBLE PRECISION[], DOUBLE PRECISION[])';
+    IF (SELECT prorettype != 'DOUBLE PRECISION'::regtype OR proisagg = TRUE
+        FROM pg_proc WHERE oid = proc_fn_dist_weighting) THEN
+        RAISE EXCEPTION 'knn error: Distance Weighting function has wrong signature or is not a simple function.';
+    END IF;
+
+    /** Extra parameter check added so that ERROR output is more user-readable (doesn't include Python traceback) */
+    IF (k <= 0) THEN
+        RAISE EXCEPTION 'k must be a positive integer.';
+    END IF;
+    IF (k > 32767) THEN
+        RAISE EXCEPTION 'knn Error: Number of nearest neighbors exceeded maximum limit
+        Number of k must be <= 32767 (for results to be returned in a
+        reasonable amount of time).';
+    END IF;
+    EXECUTE $sql$ SELECT count(*)
+                  FROM $sql$ || textin(regclassout(rel_train_regclass)) || $sql$
+            INTO num_points ;
+    IF (num_points < k) THEN
+        RAISE EXCEPTION 'k is greater than number of points in the training set.';
+    END IF;
+
+
+    EXECUTE $sql$ SELECT count(*)
+                  FROM $sql$ || textin(regclassout(rel_test_regclass)) || $sql$
+            INTO rel_test_size ;
+
+
+    PERFORM MADLIB_SCHEMA.create_schema_pg_temp();
+    /** Unfortunately, the EXECUTE USING syntax is only available starting
+     PostgreSQL 8.4:
+     http://www.postgresql.org/docs/8.4/static/plpgsql-statements.html#PLPGSQL-STATEMENTS-EXECUTING-DYN
+     We therefore have to emulate.
+    */
+    PERFORM MADLIB_SCHEMA.internal_execute_using_knn_args($sql$
+        DROP TABLE IF EXISTS pg_temp._madlib_knn_args;
+        CREATE TABLE pg_temp._madlib_knn_args AS
+        SELECT
+            $1 AS distances,
+            $2 AS k,
+            $3 AS rel_test_size,
+            $4 AS fn_dist,
+            $5 AS fn_dist_name,
+            $6 AS fn_dist_weighting,
+            $7 AS fn_dist_weighting_name;
+        $sql$,
+        distances, 
+        k, 
+        rel_test_size, 
+        proc_fn_dist,
+        fn_dist,
+        proc_fn_dist_weighting,
+        fn_dist_weighting);
+
+    //Temporary table for each input in test table
+    EXECUTE 
+        $sql$
+        DROP TABLE IF EXISTS pg_temp._madlib_knn_iter_distances;
+        CREATE TABLE pg_temp._madlib_knn_iter_distances (
+              row_num     INTEGER,
+              distance    INTEGER
+        );
+        $sql$
+    //Temporary table for the results
+    EXECUTE
+    	$sql$
+    	DROP TABLE IF EXISTS pg_temp._madlib_knn_temp_results;
+    	CREATE TABLE pg_temp._madlib_knn_temp_results (
+    		row_num 	INTEGER,
+    		neighbors_row_num INTEGER[]
+		);
+		$sql$
+
+
+    /** Perform acutal computation. */
+    FOR row IN SELECT row_number() OVER () as test_row_num, * FROM rel_test LOOP
+        FOR r IN SELECT row_number() OVER () as train_row_num, * FROM rel_train LOOP
+            euclidean_distance(r, row, distance);
+            INSERT INTO pg_temp._madlib_knn_iter_distances(row_num,distance) VALUES (r.train_row_num, distance);
+        END LOOP;
+        /** Take k closest neighbors from iter_distances and insert into results */
+        neighbors := array(SELECT row_num FROM pg_temp._madlib_knn_iter_distances ORDER BY distance LIMIT k);
+        INSERT INTO pg_temp._madlib_knn_temp_results(row_num, neighbors_row_num) VALUES (row.test_row_num, neighbors);
+        /** Clear tmp table for next data point in test set */
+        TRUNCATE pg_temp._madlib_knn_iter_distances
+    END LOOP;
+
+    -- Retrieve result from state table and return it
+    EXECUTE
+        $sql$
+        SELECT (_state).centroids, (_state).objective_fn,
+            (_state).frac_reassigned, NULL
+        FROM _madlib_kmeans_state
+        WHERE _iteration = $sql$ || theIteration || $sql$
+        $sql$
+        INTO theResult;
+    -- The number of iterations are not updated in the C++ code. We do it here.
+    IF NOT (theResult IS NULL) THEN
+        theResult.num_iterations = theIteration;
+    END IF;
+    m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `
+        EXECUTE $sql$ SET optimizer=$sql$ || old_optimizer;', `')
+    EXECUTE 'SET client_min_messages TO ' || oldClientMinMessages;
+    RETURN theResult;
+END;
+$$ LANGUAGE plpgsql VOLATILE
+m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `MODIFIES SQL DATA', `');
+
+/** Run knn with default k=1 */
+CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.knn(
+    rel_source VARCHAR,
+    rel_test VARCHAR,
+    ignore_col_train VARCHAR,
+    fn_dist VARCHAR /*+ DEFAULT 'squared_dist_norm2' */,
+    fn_dist_weighting VARCHAR /*+ DEFAULT 'none' */
+) RETURNS MADLIB_SCHEMA.knn_result
+VOLATILE
+LANGUAGE sql AS $$
+    SELECT MADLIB_SCHEMA.knn($1, $2, $3, $4, $5, 1)
+$$
+m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `MODIFIES SQL DATA', `');
+
+/** Run knn with default fn_dist_weighting=none and k=1 */
+CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.knn(
+    rel_source VARCHAR,
+    rel_test VARCHAR,
+    ignore_col_train VARCHAR,
+    fn_dist VARCHAR /*+ DEFAULT 'squared_dist_norm2' */
+) RETURNS MADLIB_SCHEMA.knn_result
+VOLATILE
+LANGUAGE sql AS $$
+    SELECT MADLIB_SCHEMA.knn($1, $2, $3, $4, 'none', 1)
+$$
+m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `MODIFIES SQL DATA', `');
+
+/** Run knn with default fn_dist=euclidean and fn_dist_weighting=none and k=1*/
+CREATE OR REPLACE FUNCTION MADLIB_SCHEMA.knn(
+    rel_source VARCHAR,
+    rel_test VARCHAR,
+    ignore_col_train VARCHAR
+) RETURNS MADLIB_SCHEMA.kmeans_result
+VOLATILE
+LANGUAGE sql AS $$
+    SELECT MADLIB_SCHEMA.kmeans($1, $2, $3, 'euclidean', 'none', 1)
+$$
+m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `MODIFIES SQL DATA', `');
+
+/**************************************************************/
+
+//TODO: test distance function
+CREATE FUNCTION euclidean_distance(row1 table_train, row2 table_test, OUT distance DOUBLE PRECISION) AS $$
+DECLARE
+	tmp DOUBLE PRECISION;
+BEGIN
+	FOR col IN SELECT column_name FROM information_schema.columns WHERE table_name=table_train LOOP
+	    tmp := (row1.col - row2.col);
+	    distance += tmp*tmp;
+	END LOOP;
+	distance := sqrt(distance);
+END;
+$$ LANGUAGE plpgsql;
+
+//TODO: generalize distance function into minkowski
+/**
+CREATE FUNCTION minkowski(row1 table_train, row2 table_test, p int, OUT distance DOUBLE PRECISION) AS $$
+BEGIN
+    distance = row1.f1*row2.f1;
+END;
+$$ LANGUAGE plpgsql;
+*/
+
+/** SORT AN ARRAY */
+CREATE OR REPLACE FUNCTION array_sort (ANYARRAY)
+RETURNS ANYARRAY LANGUAGE SQL
+AS $$
+SELECT ARRAY(SELECT unnest($1) ORDER BY 1)
+$$;
