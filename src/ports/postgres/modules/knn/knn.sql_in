@@ -20,7 +20,7 @@
  * @file knn.sql_in
  *
  * @brief SQL functions for k-nearest neighbor algorithm
- * @date September 2015
+ * @date March 2016
  *
  *
  *//* ----------------------------------------------------------------------- */
@@ -293,6 +293,7 @@ BEGIN
               distance    INTEGER
         );
         $sql$
+
     //Temporary table for the results
     EXECUTE
     	$sql$
@@ -313,6 +314,15 @@ BEGIN
         /** Take k closest neighbors from iter_distances and insert into results */
         neighbors := array(SELECT row_num FROM pg_temp._madlib_knn_iter_distances ORDER BY distance LIMIT k);
         INSERT INTO pg_temp._madlib_knn_temp_results(row_num, neighbors_row_num) VALUES (row.test_row_num, neighbors);
+    /** Perform acutal computation. */
+    FOR row IN SELECT * FROM rel_test LOOP
+        FOR r IN SELECT row_number() OVER () as row_num, * FROM rel_train LOOP
+            euclidean_distance(r, row, distance);
+            INSERT INTO pg_temp._madlib_knn_iter_distances(row_num,distance) VALUES (r.row_num, distance);
+        END LOOP;
+        /** Take k closest neighbors from iter_distances and insert into results */
+        //TODO: INSERT RESULTS SOMEWHERE
+        SELECT * FROM pg_temp._madlib_knn_iter_distances ORDER BY 2 LIMIT k;
         /** Clear tmp table for next data point in test set */
         TRUNCATE pg_temp._madlib_knn_iter_distances
     END LOOP;
@@ -406,4 +416,3 @@ CREATE OR REPLACE FUNCTION array_sort (ANYARRAY)
 RETURNS ANYARRAY LANGUAGE SQL
 AS $$
 SELECT ARRAY(SELECT unnest($1) ORDER BY 1)
-$$;
